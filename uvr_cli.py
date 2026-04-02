@@ -91,6 +91,37 @@ def _split_audio_if_needed(path: str, max_seconds: int, work_root: str, logger):
         return [path], None
 
     base_name = os.path.splitext(os.path.basename(path))[0]
+    split_prefix = f"uvr_cli_split_{base_name}_"
+
+    # Reuse existing split folder if present.
+    if os.path.isdir(work_root):
+        candidates = []
+        for name in os.listdir(work_root):
+            if not name.startswith(split_prefix):
+                continue
+            dir_path = os.path.join(work_root, name)
+            if not os.path.isdir(dir_path):
+                continue
+            wavs = sorted(
+                os.path.join(dir_path, f)
+                for f in os.listdir(dir_path)
+                if f.endswith(".wav")
+            )
+            if wavs:
+                try:
+                    mtime = os.path.getmtime(dir_path)
+                except Exception:
+                    mtime = 0
+                candidates.append((mtime, dir_path, wavs))
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            _, split_dir, wavs = candidates[0]
+            logger.write(
+                f"Reusing existing split folder '{os.path.basename(split_dir)}' "
+                f"with {len(wavs)} chunk(s).\n"
+            )
+            return wavs, split_dir
+
     split_dir = tempfile.mkdtemp(prefix=f"uvr_cli_split_{base_name}_", dir=work_root)
     chunk_pattern = os.path.join(split_dir, f"{base_name}_part_%03d.wav")
 
@@ -214,13 +245,25 @@ def main():
     parser.add_argument("--tta", action="store_true", help="Enable TTA (VR)")
     parser.add_argument("--postprocess", action="store_true", help="Enable postprocess (VR)")
     parser.add_argument("--normalize", action="store_true", help="Normalize output")
-    parser.add_argument("--save-format", default="Wav", choices=["Wav", "Flac", "Mp3"], help="Output format")
+    parser.add_argument("--save-format", default="Mp3", choices=["Wav", "Flac", "Mp3"], help="Output format")
     parser.add_argument("--wavtype", default="PCM_16", help="WAV subtype (e.g., PCM_16)")
     parser.add_argument("--flactype", default="PCM_16", help="FLAC subtype (e.g., PCM_16)")
     parser.add_argument("--mp3bit", default="320k", help="MP3 bitrate (e.g., 320k)")
     parser.add_argument("--model-params", default="Auto", help="Model params (Auto or specific)")
-    parser.add_argument("--max-chunk-seconds", type=int, default=3600, help="Max chunk length in seconds when splitting long inputs",)
+    parser.add_argument("--max-chunk-seconds", type=int, default=1800, help="Max chunk length in seconds when splitting long inputs",)
     parser.add_argument("--quiet", action="store_true", help="Reduce console output")
+    stem_group = parser.add_mutually_exclusive_group()
+    stem_group.add_argument(
+        "--instrumental-only",
+        action="store_true",
+        default=True,
+        help="Export only instrumental stems (default)",
+    )
+    stem_group.add_argument(
+        "--both",
+        action="store_true",
+        help="Export both instrumental and vocals",
+    )
 
     args = parser.parse_args()
 
@@ -261,6 +304,16 @@ def main():
     button_widget = DummyButton()
     progress_var = ProgressVar()
 
+    save_ext = {
+        "Wav": "wav",
+        "Flac": "flac",
+        "Mp3": "mp3",
+    }[args.save_format]
+
+    expected_suffixes = ["(Instrumental)"]
+    if args.both:
+        expected_suffixes.append("(Vocals)")
+
     max_chunk_seconds = args.max_chunk_seconds
     expanded_inputs = []
     split_plan = []
@@ -278,10 +331,13 @@ def main():
             }
         )
         for chunk_path in chunks:
+            chunk_base = os.path.splitext(os.path.basename(chunk_path))[0]
             expanded_inputs.append(
                 {
                     "orig_index": orig_index,
                     "chunk_path": chunk_path,
+                    "chunk_base": chunk_base,
+                    "seq": len(expanded_inputs) + 1,
                 }
             )
 
@@ -299,42 +355,94 @@ def main():
 
     tk.messagebox = types.SimpleNamespace(askyesno=askyesno, showerror=showerror)
 
-    kwargs = {
-        "agg": args.agg,
-        "gpu": args.gpu,
-        "input_paths": [e["chunk_path"] for e in expanded_inputs],
-        "instrumentalModel": model_path,
-        "export_path": os.path.abspath(output_dir),
-        "ModelParams": args.model_params,
-        "saveFormat": args.save_format,
-        "wavtype": args.wavtype,
-        "flactype": args.flactype,
-        "mp3bit": args.mp3bit,
-        "overlap": args.overlap,
-        "shifts": args.shifts,
-        "split_mode": args.split_mode,
-        "tta": args.tta,
-        "postprocess": args.postprocess,
-        "normalize": args.normalize,
-        "segment": "None",
-        "settest": False,
-        "inst_only": False,
-        "voc_only": False,
-        "useModel": "instrumental",
-        "demucsmodelVR": False,
-        "demucsmodel_sel_VR": "UVR_Demucs_Model_1",
-        "modelFolder": False,
-        "output_image": False,
-        "window_size": args.window_size,
-    }
+    def _expected_outputs(seq, chunk_base):
+        base_name = os.path.join(output_dir, f"{seq}_{chunk_base}")
+        return [
+            f"{base_name}_{suffix}.{save_ext}"
+            for suffix in expected_suffixes
+        ]
 
-    inference_v5.main(None, text_widget, button_widget, progress_var, **kwargs)
+    resume_enabled = True
+    to_process = expanded_inputs
+    if resume_enabled:
+        first_missing_seq = None
+        for entry in expanded_inputs:
+            outputs = _expected_outputs(entry["seq"], entry["chunk_base"])
+            if not all(os.path.isfile(p) for p in outputs):
+                first_missing_seq = entry["seq"]
+                break
 
-    save_ext = {
-        "Wav": "wav",
-        "Flac": "flac",
-        "Mp3": "mp3",
-    }[args.save_format]
+        if first_missing_seq is None:
+            to_process = []
+            text_widget.write("Resume enabled: all chunks already processed. Skipping inference.\n")
+        else:
+            to_process = [e for e in expanded_inputs if e["seq"] >= first_missing_seq]
+            if first_missing_seq > 1:
+                text_widget.write(
+                    f"Resume enabled: starting from chunk {first_missing_seq}.\n"
+                )
+            # Remove any outputs for later chunks so they get re-generated.
+            for entry in expanded_inputs:
+                if entry["seq"] < first_missing_seq:
+                    continue
+                for path in _expected_outputs(entry["seq"], entry["chunk_base"]):
+                    if os.path.isfile(path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+
+    if not to_process:
+        pass
+    else:
+        kwargs = {
+            "agg": args.agg,
+            "gpu": args.gpu,
+            "input_paths": [e["chunk_path"] for e in to_process],
+            "instrumentalModel": model_path,
+            "export_path": os.path.abspath(output_dir),
+            "ModelParams": args.model_params,
+            "saveFormat": args.save_format,
+            "wavtype": args.wavtype,
+            "flactype": args.flactype,
+            "mp3bit": args.mp3bit,
+            "overlap": args.overlap,
+            "shifts": args.shifts,
+            "split_mode": args.split_mode,
+            "tta": args.tta,
+            "postprocess": args.postprocess,
+            "normalize": args.normalize,
+            "segment": "None",
+            "settest": False,
+            "inst_only": (not args.both),
+            "voc_only": False,
+            "useModel": "instrumental",
+            "demucsmodelVR": False,
+            "demucsmodel_sel_VR": "UVR_Demucs_Model_1",
+            "modelFolder": False,
+            "output_image": False,
+            "window_size": args.window_size,
+        }
+
+        inference_v5.main(None, text_widget, button_widget, progress_var, **kwargs)
+
+        if len(to_process) != len(expanded_inputs):
+            for run_idx, entry in enumerate(to_process, start=1):
+                produced = _expected_outputs(run_idx, entry["chunk_base"])
+                target = _expected_outputs(entry["seq"], entry["chunk_base"])
+                for src, dst in zip(produced, target):
+                    if not os.path.isfile(src):
+                        continue
+                    if os.path.isfile(dst):
+                        try:
+                            os.remove(src)
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        os.replace(src, dst)
+                    except Exception:
+                        pass
 
     has_splits = any(len(p["chunks"]) > 1 for p in split_plan)
     if has_splits:
@@ -346,7 +454,7 @@ def main():
             }
 
         for file_num, entry in enumerate(expanded_inputs, start=1):
-            chunk_base = os.path.splitext(os.path.basename(entry["chunk_path"]))[0]
+            chunk_base = entry["chunk_base"]
             base_name = os.path.join(output_dir, f"{file_num}_{chunk_base}")
             for suffix in ("(Instrumental)", "(Vocals)"):
                 candidate = f"{base_name}_{suffix}.{save_ext}"
