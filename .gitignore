@@ -2,3 +2,5 @@ demucs/__pycache__/
 __pycache__
 models/Main_Models
 models/MDX_Net_Models/
+temp.wav
+.codex

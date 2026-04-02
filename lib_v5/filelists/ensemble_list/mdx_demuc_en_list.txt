@@ -1,2 +1,4 @@
 No Model
 No Model
+MDX-Net: UVR-MDX-NET Karaoke
+MDX-Net: UVR-MDX-NET Main

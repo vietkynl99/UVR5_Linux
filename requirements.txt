@@ -24,7 +24,6 @@ pyglet
 pyperclip
 pyyaml
 resampy==0.2.2
-samplerate
 screeninfo
 scipy
 SoundFile
