@@ -252,6 +252,15 @@ def main():
     parser.add_argument("--model-params", default="Auto", help="Model params (Auto or specific)")
     parser.add_argument("--max-chunk-seconds", type=int, default=1800, help="Max chunk length in seconds when splitting long inputs",)
     parser.add_argument("--quiet", action="store_true", help="Reduce console output")
+    parser.add_argument(
+        "--output-name",
+        required=False,
+        help=(
+            "Custom output filename template (without directory). "
+            "Available fields: {orig_index}, {orig_base}, {seq}, {chunk_base}, "
+            "{suffix}, {ext}. If {ext} is omitted, the extension is appended."
+        ),
+    )
     stem_group = parser.add_mutually_exclusive_group()
     stem_group.add_argument(
         "--instrumental-only",
@@ -355,19 +364,78 @@ def main():
 
     tk.messagebox = types.SimpleNamespace(askyesno=askyesno, showerror=showerror)
 
-    def _expected_outputs(seq, chunk_base):
+    output_name_template = args.output_name
+
+    def _render_output_name(template, context, fallback_name):
+        if not template:
+            return fallback_name
+        try:
+            name = template.format(**context)
+        except KeyError as exc:
+            raise ValueError(f"Unknown placeholder in --output-name: {exc}") from exc
+        if "{ext}" not in template and not name.lower().endswith(f".{context['ext'].lower()}"):
+            name = f"{name}.{context['ext']}"
+        return name
+
+    def _produced_outputs(seq, chunk_base):
         base_name = os.path.join(output_dir, f"{seq}_{chunk_base}")
         return [
             f"{base_name}_{suffix}.{save_ext}"
             for suffix in expected_suffixes
         ]
 
+    def _target_output_path(orig_index, orig_base, seq, chunk_base, suffix, is_split):
+        if is_split:
+            fallback = f"{orig_index}_{orig_base}_{suffix}.{save_ext}"
+        else:
+            fallback = f"{seq}_{chunk_base}_{suffix}.{save_ext}"
+        context = {
+            "orig_index": orig_index,
+            "orig_base": orig_base,
+            "seq": seq,
+            "chunk_base": chunk_base,
+            "suffix": suffix,
+            "ext": save_ext,
+        }
+        name = _render_output_name(output_name_template, context, fallback)
+        return os.path.join(output_dir, name)
+
+    def _expected_outputs_for_resume(entry, plan):
+        if not output_name_template:
+            return _produced_outputs(entry["seq"], entry["chunk_base"])
+        is_split = len(plan["chunks"]) > 1
+        return [
+            _target_output_path(
+                plan["orig_index"],
+                plan["orig_base"],
+                entry["seq"],
+                entry["chunk_base"],
+                suffix,
+                is_split,
+            )
+            for suffix in expected_suffixes
+        ]
+
+    def _safe_rename(src, dst, logger):
+        if not os.path.isfile(src) or src == dst:
+            return
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.isfile(dst):
+            logger.write(f"Target exists, keeping existing file: {dst}\n")
+            return
+        try:
+            os.replace(src, dst)
+        except Exception:
+            logger.write(f"Failed to rename '{src}' -> '{dst}'.\n")
+
     resume_enabled = True
     to_process = expanded_inputs
     if resume_enabled:
         first_missing_seq = None
+        plan_by_orig = {p["orig_index"]: p for p in split_plan}
         for entry in expanded_inputs:
-            outputs = _expected_outputs(entry["seq"], entry["chunk_base"])
+            plan = plan_by_orig[entry["orig_index"]]
+            outputs = _expected_outputs_for_resume(entry, plan)
             if not all(os.path.isfile(p) for p in outputs):
                 first_missing_seq = entry["seq"]
                 break
@@ -385,7 +453,8 @@ def main():
             for entry in expanded_inputs:
                 if entry["seq"] < first_missing_seq:
                     continue
-                for path in _expected_outputs(entry["seq"], entry["chunk_base"]):
+                plan = plan_by_orig[entry["orig_index"]]
+                for path in _expected_outputs_for_resume(entry, plan):
                     if os.path.isfile(path):
                         try:
                             os.remove(path)
@@ -444,6 +513,26 @@ def main():
                     except Exception:
                         pass
 
+        if output_name_template:
+            plan_by_orig = {p["orig_index"]: p for p in split_plan}
+            for entry in expanded_inputs:
+                plan = plan_by_orig[entry["orig_index"]]
+                if len(plan["chunks"]) > 1:
+                    continue
+                for suffix in expected_suffixes:
+                    src = _produced_outputs(entry["seq"], entry["chunk_base"])[
+                        expected_suffixes.index(suffix)
+                    ]
+                    dst = _target_output_path(
+                        plan["orig_index"],
+                        plan["orig_base"],
+                        entry["seq"],
+                        entry["chunk_base"],
+                        suffix,
+                        False,
+                    )
+                    _safe_rename(src, dst, text_widget)
+
     has_splits = any(len(p["chunks"]) > 1 for p in split_plan)
     if has_splits:
         outputs_by_orig = {}
@@ -488,6 +577,16 @@ def main():
                             os.remove(part)
                         except Exception:
                             pass
+                    if output_name_template:
+                        target_path = _target_output_path(
+                            orig_index,
+                            orig_base,
+                            orig_index,
+                            orig_base,
+                            suffix,
+                            True,
+                        )
+                        _safe_rename(final_path, target_path, text_widget)
                 else:
                     text_widget.write(
                         f"Failed to merge chunks for '{orig_base}' {suffix}. Keeping chunk outputs.\n"
